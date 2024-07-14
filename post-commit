@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+# dlitz 2024
+import functools
+import hashlib
+import re
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from io import BytesIO, StringIO
+from pathlib import Path
+from subprocess import PIPE, STDOUT, CalledProcessError
+
+_nodefault = object()
+
+
+def one(iterable, too_short=None, too_long=None):
+    _nodefault = object()
+    res = only(iterable, _nodefault, too_long)
+    if res is _nodefault:
+        if too_short is None:
+            too_short = ValueError("too few items")
+        raise too_short
+    return res
+
+
+def only(iterable, default=None, too_long=None):
+    it = iter(iterable)
+    try:
+        res = next(it)
+    except StopIteration:
+        return default
+    try:
+        next(it)
+    except StopIteration:
+        return res
+    if too_long is None:
+        too_long = ValueError("too many items")
+    raise too_long
+
+
+def _chomp(s, *, text=True, zero_terminated=False):
+    if zero_terminated:
+        if text and s.endswith("\0"):
+            s = s[:-1]
+        elif not text and s.endswith(b"\0"):
+            s = s[:-1]
+    else:
+        if text and s.endswith("\n"):
+            s = s[:-1]
+        elif not text and s.endswith(b"\n"):
+            s = s[:-1]
+    return s
+
+
+def mark_ends(iterable):
+    is_first = True
+    is_last = False
+    count = 0
+    for item in iterable:
+        if count != 0:
+            yield is_first, is_last, prev
+        is_first = False
+        prev = item
+        count += 1
+    if count != 0:
+        is_last = True
+        yield is_first, is_last, prev
+
+
+def sha512(data: bytes):
+    return hashlib.new("sha512", data).digest()
+
+
+def linesplit(data, *, eol):
+    pos = 0
+    while pos < len(data):
+        try:
+            idx = data.index(eol, pos)
+        except ValueError:
+            idx = len(data)
+        yield data[pos : idx + 1]
+        pos = idx + 1
+
+
+def run_wrapper(
+    args,
+    *,
+    capture=False,
+    chomp=None,
+    text=True,
+    zero_terminated=False,
+    split=True,
+    **kw,
+):
+    kw["text"] = text
+    kw.setdefault("check", True)
+    if capture:
+        kw.setdefault("stdout", subprocess.PIPE)
+    if chomp is None:
+        chomp = text
+    cproc = subprocess.run(args, **kw)
+    stdout = cproc.stdout
+    if stdout is None or not split:
+        return stdout
+    result = []
+    if zero_terminated:
+        lines = list(linesplit(stdout, eol="\0" if text else b"\0"))
+    else:
+        lines = StringIO(stdout) if text else BytesIO(stdout)
+    for is_first, is_last, line in mark_ends(lines):
+        if chomp:
+            if is_last and not line:
+                break
+            line = _chomp(line, text=text, zero_terminated=zero_terminated)
+        result.append(line)
+    return result
+
+
+class Git:
+    def run_git(self, args, capture=False, chomp=None, text=True, **kw):
+        return run_wrapper(
+            ["git", *args], capture=capture, chomp=chomp, text=text, **kw
+        )
+
+    def rev_parse(self, ref, *, default=_nodefault, verify=True, quiet=None):
+        assert not ref.startswith("-")
+        args = ["rev-parse"]
+        if default is not _nodefault:
+            if quiet is None:
+                quiet = True
+        if quiet:
+            args += ["--quiet"]
+        if verify:
+            args += ["--verify", "--end-of-options"]
+        args += [ref]
+        try:
+            return one(self.run_git(args, capture=True, text=True))
+        except CalledProcessError as exc:
+            if exc.returncode == 1 and default is not _nodefault:
+                return default
+            raise
+
+    def hash_object(self, otype, data, *, write) -> str:
+        args = ["hash-object", "-t", otype]
+        if write:
+            args.append("-w")
+        args.append("--stdin")
+        return one(
+            self.run_git(args, input=data, capture=True, text=False, chomp=True)
+        ).decode()
+
+    def mktree(self, entries) -> str:
+        data = b"".join(entry.to_git().encode() for entry in entries)
+        return one(
+            self.run_git(
+                ["mktree", "-z"],
+                input=data,
+                capture=True,
+                text=False,
+                chomp=True,
+            )
+        ).decode()
+
+    def symbolic_ref_get(
+        self, name, *, default=_nodefault, quiet=False, short=False, recurse=None
+    ):
+        args = ["symbolic-ref"]
+        if quiet:
+            args += ["--quiet"]
+        if short:
+            args += ["--short"]
+        if recurse is not None:
+            args += ["--recurse" if recurse else "--no-recurse"]
+        args += [name]
+        try:
+            return one(self.run_git(args, capture=True, text=True))
+        except CalledProcessError as exc:
+            if exc.returncode == 1 and default is not _nodefault:
+                return default
+            raise
+
+    def commit_tree(self, tree_id, *, message, parent=None, parents=None):
+        if parent is not None and parents is not None:
+            raise TypeError("'parent' and 'parents' params are mutually exclusive")
+        elif parent is not None:
+            parents = [parent]
+        elif parents is None:
+            parents = []
+        assert isinstance(message, str)
+        args = ["commit-tree", "-F", "-"]
+        for parent_id in parents:
+            args += ["-p", parent_id]
+        args += [tree_id]
+        return one(self.run_git(args, input=message, capture=True, text=True))
+
+    def update_ref(self, ref, new_oid, *, old_oid=None):
+        args = ["update-ref", ref, new_oid]
+        if old_oid is not None:
+            args += [old_oid]
+        self.run_git(args, capture=False)
+
+    def merge_base(self, *refs, default=_nodefault, all=False, octopus=False):
+        args = ["merge-base"]
+        if all:
+            args += ["--all"]
+        if octopus:
+            args += ["--octopus"]
+        args += refs
+        try:
+            result = self.run_git(args, capture=True, text=True)
+        except CalledProcessError as exc:
+            if exc.returncode == 1 and default is not _nodefault:
+                return default
+            raise
+        if all:
+            return result
+        return one(result)
+
+    def ls_tree(self, tree_ish, *paths, object_only=None, full_tree=None):
+        args = ["ls-tree", "-z"]
+        if full_tree:
+            args += ["--full-tree"]
+        if object_only:
+            args += ["--object-only"]
+        args += [tree_ish, *paths]
+        return self.run_git(args, capture=True, text=True, zero_terminated=True)
+
+    def cat_blob(self, object_id, *, text=False):
+        return self.run_git(
+            ["cat-file", "blob", object_id], capture=True, text=text, split=False
+        )
+
+    def read_file(self, tree_ish, path, full_tree=False, text=False):
+        blob_id = one(
+            self.ls_tree(tree_ish, path, object_only=True, full_tree=full_tree)
+        )
+        return self.cat_blob(blob_id, text=text)
+
+    @dataclass
+    class TreeEntry:
+        mode: int
+        obj_type: str
+        obj_id: str
+        filename: str
+
+        def to_git(self):
+            return f"{self.mode:06o} {self.obj_type} {self.obj_id}\t{self.filename}\0"
+
+
+class Timestamper:
+    def __init__(self, *, url, cacert):
+        self.url = url
+        self.cacert = cacert
+
+    def run_openssl(self, args, **kw):
+        return run_wrapper(["openssl", *args], **kw)
+
+    def create_ts_query(self, data: bytes) -> bytes:
+        cproc = subprocess.run(
+            [
+                "openssl",
+                "ts",
+                "-query",
+                "-no_nonce",
+                "-sha512",
+                "-cert",
+                "-digest",
+                sha512(data).hex(),
+            ],
+            stdout=PIPE,
+            check=True,
+        )
+        return cproc.stdout
+
+    def text_from_ts_query(self, ts_query: bytes) -> str:
+        with tempfile.NamedTemporaryFile() as tf:
+            tf.write(ts_query)
+            tf.flush()
+            cproc = subprocess.run(
+                ["openssl", "ts", "-query", "-in", tf.name, "-text"],
+                stdout=PIPE,
+                check=True,
+                text=True,
+            )
+        return cproc.stdout
+
+    def text_from_ts_reply(self, ts_reply: bytes) -> str:
+        with tempfile.NamedTemporaryFile() as tf:
+            tf.write(ts_reply)
+            tf.flush()
+            cproc = subprocess.run(
+                ["openssl", "ts", "-reply", "-in", tf.name, "-text"],
+                stdout=PIPE,
+                check=True,
+                text=True,
+            )
+        return cproc.stdout
+
+    def request_timestamp(self, ts_query: bytes) -> bytes:
+        cproc = subprocess.run(
+            [
+                "curl",
+                "-fSs",
+                "-H",
+                "Content-Type: application/timestamp-query",
+                "--data-binary",
+                "@-",
+                self.url,
+            ],
+            input=ts_query,
+            stdout=PIPE,
+            check=True,
+        )
+        return cproc.stdout
+
+    def verify_timestamp(self, ts_reply: bytes, *, ts_data=None, ts_query=None):
+        assert (
+            ts_data is None or ts_query is None
+        ), "ts_data and ts_query are mutually exclusive"
+        assert (
+            ts_data is not None or ts_query is not None
+        ), "one of ts_data or ts_query must be specified"
+        with (
+            tempfile.NamedTemporaryFile(suffix=".tsq") as tsq,
+            tempfile.NamedTemporaryFile(suffix=".tsr") as tsr,
+            tempfile.NamedTemporaryFile(suffix=".pem") as cacert,
+            tempfile.NamedTemporaryFile(suffix=".txt") as datafile,
+        ):
+            tsr.write(ts_reply)
+            tsr.flush()
+            cacert.write(self.cacert)
+            cacert.flush()
+            if ts_query is not None:
+                tsq.write(ts_query)
+                tsq.flush()
+            if ts_data is not None:
+                datafile.write(ts_data)
+                datafile.flush()
+            args = ["openssl", "ts", "-verify", "-CAfile", cacert.name, "-in", tsr.name]
+            if ts_data is not None:
+                args += ["-data", datafile.name]
+            elif ts_query is not None:
+                args += ["-queryfile", tsq.name]
+            cproc = subprocess.run(
+                args, stdout=PIPE, stderr=STDOUT, text=True, check=True
+            )
+            return cproc.stdout
+
+
+def post_commit_hook():
+    cacert = Path(".ts/freetsa.org/cacert.pem").read_bytes()
+    url = one(StringIO(Path(".ts/freetsa.org/url").read_text().strip()))
+    git = Git()
+    ts = Timestamper(url=url, cacert=cacert)
+
+    branch_ref = git.symbolic_ref_get("HEAD", default=None, recurse=False, quiet=True)
+    if branch_ref is None:
+        print("Not timestamping detached HEAD", file=sys.stderr)
+        sys.exit(1)
+    elif (branch_ref + "/").startswith("refs/heads/timestamps/"):
+        print(f"Not recursively timestamping ref: {branch_ref}", file=sys.stderr)
+        sys.exit(1)
+    if m := re.fullmatch("^refs/heads/(.*)$", branch_ref):
+        branch_name = m[1]
+    else:
+        print(f"Not on a branch: {branch_ref}; not timestamping.", file=sys.stderr)
+        sys.exit(1)
+    ts_branch_name = f"timestamps/{branch_name}"
+    ts_branch_ref = f"refs/heads/{ts_branch_name}"
+    ts_branch_head = git.rev_parse(ts_branch_ref, default=None)
+    wrote_initial_commit = False
+    if ts_branch_head is None:
+        wrote_initial_commit = True
+        print(f"Creating branch: {ts_branch_ref}")
+        cacert_objid = git.hash_object("blob", cacert, write=True)
+        url_objid = git.hash_object("blob", f"{url}\n".encode(), write=True)
+        subtree_objid = git.mktree(
+            [
+                Git.TreeEntry(0o100644, "blob", cacert_objid, "cacert.pem"),
+                Git.TreeEntry(0o100644, "blob", url_objid, "url"),
+            ]
+        )
+        tree_objid = git.mktree(
+            [
+                Git.TreeEntry(0o040000, "tree", subtree_objid, ".tsdata"),
+            ]
+        )
+        message = (
+            f"Initial commit on timestamping branch\n"
+            f"\n"
+            f"Timestamp-Initial-Commit: true\n"
+        )
+        ts_commit_id = git.commit_tree(tree_objid, message=message, parents=())
+        git.update_ref(ts_branch_ref, ts_commit_id, old_oid="")
+        ts_branch_head = git.rev_parse(ts_branch_ref, default=None)
+        assert ts_branch_head == ts_commit_id
+        print(f"Initial {ts_branch_ref} commit ID: {ts_branch_head}")
+
+    commit_id = git.rev_parse("HEAD")
+
+    # Figure out parents
+    if wrote_initial_commit:
+        parents = [ts_branch_head, commit_id]
+    else:
+        merge_base_id = git.merge_base(commit_id, ts_branch_head, default=None)
+        if merge_base_id is None:
+            assert git.rev_parse(f"{commit_id}^", default=None) is None
+        # Find the last commit in the timestamp branch that matches the merge-base
+        # This allows us to rebase, etc.
+        new_parent = git.rev_parse(
+            f"{ts_branch_ref}^{{/Timestamp-Commit-ID: {merge_base_id}}}", default=None
+        )
+        if new_parent is None:
+            new_parent = git.rev_parse(f"{ts_branch_ref}^")
+
+        parents = [new_parent, commit_id]
+
+    print(f"Timestamping commit ID: {commit_id}")
+    ts_data = f"Commit ID: {commit_id}\n".encode()
+    ts_query = ts.create_ts_query(ts_data)
+    ts_reply = ts.request_timestamp(ts_query)
+    ts.verify_timestamp(ts_reply, ts_data=ts_data)
+    ts.verify_timestamp(ts_reply, ts_query=ts_query)
+    tsdata_objid = git.hash_object("blob", ts_data, write=True)
+    tsq_objid = git.hash_object("blob", ts_query, write=True)
+    tsr_objid = git.hash_object("blob", ts_reply, write=True)
+    cacert_objid = git.hash_object("blob", cacert, write=True)
+    url_objid = git.hash_object("blob", f"{url}\n".encode(), write=True)
+    subtree_objid = git.mktree(
+        [
+            Git.TreeEntry(0o100644, "blob", tsdata_objid, "timestamp-data"),
+            Git.TreeEntry(0o100644, "blob", tsq_objid, "timestamp-data.tsq"),
+            Git.TreeEntry(0o100644, "blob", tsr_objid, "timestamp-data.tsr"),
+            Git.TreeEntry(0o100644, "blob", cacert_objid, "cacert.pem"),
+            Git.TreeEntry(0o100644, "blob", url_objid, "url"),
+        ]
+    )
+    tree_objid = git.mktree(
+        [
+            Git.TreeEntry(0o040000, "tree", subtree_objid, ".tsdata"),
+        ]
+    )
+    message = (
+        f"RFC 3161 timestamp for commit {commit_id}\n"
+        f"\n"
+        f"Timestamp-Commit-ID: {commit_id}\n"
+        f"Timestamp-URL: {url}\n"
+    )
+    ts_commit_id = git.commit_tree(tree_objid, message=message, parents=parents)
+    git.update_ref(ts_branch_ref, ts_commit_id, old_oid=ts_branch_head or "")
+    print(f"Committed timestamp")
+
+
+def verify_timestamp(commit_ish, branch=None):
+    cacert = Path(".ts/freetsa.org/cacert.pem").read_bytes()
+    git = Git()
+
+    # Find the branch reference
+    if branch is None:
+        branch_ref = git.symbolic_ref_get(
+            "HEAD", default=None, recurse=False, quiet=True
+        )
+    else:
+        if branch.startswith("refs/"):
+            branch_ref = branch
+        else:
+            branch_ref = f"refs/heads/{branch}"
+    assert branch_ref.startswith("refs/heads/"), branch_ref
+
+    ts_branch_ref = None
+
+    if branch_ref is None:
+        print("Can't verify timestamp of detached HEAD", file=sys.stderr)
+        sys.exit(1)
+    elif m := re.fullmatch(r"refs/heads/timestamps/(.*)", branch_ref):
+        ts_branch_ref = branch_ref
+        branch_ref = f"refs/heads/{m[1]}"
+    elif m := re.fullmatch(r"refs/heads/(.*)", branch_ref):
+        branch_ref = f"refs/heads/{m[1]}"
+        ts_branch_ref = f"refs/heads/timestamps/{m[1]}"
+    else:
+        assert 0, (branch, branch_ref)
+
+    ts_branch_head = git.rev_parse(ts_branch_ref, default=None)
+    branch_head = git.rev_parse(branch_ref, default=None)
+    assert ts_branch_head is not None and branch_head is not None, (
+        ts_branch_head,
+        branch_head,
+    )
+
+    commit_id = git.rev_parse(commit_ish, default=None)
+    assert commit_id is not None
+
+    ts_commit_id = git.rev_parse(
+        f"{ts_branch_ref}^{{/Timestamp-Commit-ID: {commit_id}}}", default=None
+    )
+    if ts_commit_id is None:
+        print(f"Couldn't find timestamp for commit-id {commit_id}", file=sys.stderr)
+        sys.exit(1)
+
+    url = one(
+        StringIO(git.read_file(ts_commit_id, ".tsdata/url", full_tree=True, text=True))
+    ).strip()
+    ts_data = git.read_file(ts_commit_id, ".tsdata/timestamp-data", full_tree=True)
+    ts_query = git.read_file(ts_commit_id, ".tsdata/timestamp-data.tsq", full_tree=True)
+    ts_reply = git.read_file(ts_commit_id, ".tsdata/timestamp-data.tsr", full_tree=True)
+
+    ts = Timestamper(url=None, cacert=cacert)
+    result = ts.verify_timestamp(ts_reply, ts_query=ts_query)
+    result = ts.verify_timestamp(ts_reply, ts_data=ts_data)
+    print("=== Timestamp data ===")
+    print(f"= Length: {len(ts_data)}")
+    print(_chomp(ts_data.decode()))
+    print("=== Hash of timestamp data ===")
+    print("= Algorithm: SHA512")
+    print(sha512(ts_data).hex())
+    print("=== Timestamp query ===")
+    print(_chomp(ts.text_from_ts_query(ts_query)))
+    print("=== Timestamp reply ===")
+    print(_chomp(ts.text_from_ts_reply(ts_reply)))
+    print("=== Verify result ===")
+    print(result)
+
+
+def parse_args():
+    if not sys.argv[1:]:
+        return None
+    from argparse import ArgumentParser
+
+    parser = ArgumentParser(description="Perform or verify RFC 3161 timestamping")
+    parser.add_argument(
+        "-b", "--branch-name", metavar="name", help="specify alternate branch name"
+    )
+    parser.add_argument(
+        "--verify",
+        metavar="commit-ish",
+        help="Show & verify the timestamp on the specified commit ID",
+    )
+    args = parser.parse_args()
+    return args
+
+
+def main():
+    args = parse_args()
+    if args is None:
+        return post_commit_hook()
+    return verify_timestamp(args.verify, args.branch_name)
+
+
+if __name__ == "__main__":
+    main()
