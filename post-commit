@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# dlitz 2024
+# Copyright 2024 Darsey Litzenberger
+# https://github.com/dlitz/git-timestamping
+# SPDX-License-Identifier: MIT
 import functools
 import hashlib
 import re
